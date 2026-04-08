@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation'
 import ProposalPage from '@/components/ProposalPage'
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.NEXT_PUBLIC_SUPABASE_URL=https://lieuzxfkafengdsdzdzh.supabase.co,
   process.env.SUPABASE_SERVICE_KEY
 )
 
