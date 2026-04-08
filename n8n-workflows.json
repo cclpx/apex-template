@@ -1,0 +1,281 @@
+{
+  "_comentario": "Importar en N8N: Menu → Import Workflow → pegar este JSON",
+  "_descripcion": "Pipeline completo Apex Digital Growth",
+  "_flujos": [
+
+    {
+      "nombre": "1_APIFY_A_SUPABASE",
+      "descripcion": "Cuando Apify termina un run, guarda los prospectos en Supabase y activa el siguiente paso",
+      "trigger": "Webhook de Apify (configurar en Apify → Integrations → Webhooks → URL del webhook de N8N)",
+      "pasos": [
+        {
+          "nodo": "Webhook Trigger",
+          "tipo": "n8n-nodes-base.webhook",
+          "config": {
+            "path": "apify-resultado",
+            "method": "POST"
+          }
+        },
+        {
+          "nodo": "Descargar resultados de Apify",
+          "tipo": "n8n-nodes-base.httpRequest",
+          "config": {
+            "url": "https://api.apify.com/v2/actor-runs/{{$json.eventData.actorRunId}}/dataset/items",
+            "method": "GET",
+            "headers": {
+              "Authorization": "Bearer {{$env.APIFY_TOKEN}}"
+            },
+            "qs": {
+              "format": "json",
+              "limit": 1000
+            }
+          }
+        },
+        {
+          "nodo": "Filtrar solo con email o WhatsApp",
+          "tipo": "n8n-nodes-base.filter",
+          "config": {
+            "conditions": {
+              "OR": [
+                { "field": "email", "operator": "isNotEmpty" },
+                { "field": "phone", "operator": "matches", "value": "3[0-9]{9}" }
+              ]
+            }
+          }
+        },
+        {
+          "nodo": "Guardar en Supabase",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "upsert",
+            "table": "prospectos",
+            "conflictColumns": ["email"],
+            "mapping": {
+              "nombre": "={{$json.title}}",
+              "email": "={{$json.email}}",
+              "telefono": "={{$json.phone}}",
+              "whatsapp": "={{$json.phone}}",
+              "direccion": "={{$json.address}}",
+              "sitio_web": "={{$json.website}}",
+              "ciudad": "={{$json.city}}",
+              "rating": "={{$json.totalScore}}",
+              "num_reseñas": "={{$json.reviewsCount}}",
+              "tiene_email": "={{!!$json.email}}",
+              "tiene_sitio_web": "={{!!$json.website}}",
+              "estado_web": "={{$json.website ? 'tiene_sitio' : 'sin_sitio'}}",
+              "canal_contacto": "={{$json.email ? 'email' : 'whatsapp'}}",
+              "prioridad": "={{$json.email ? 'alta' : 'media'}}",
+              "score": "={{($json.email ? 4 : 0) + ($json.website ? 1 : 4) + ($json.reviewsCount > 50 ? 2 : $json.reviewsCount > 10 ? 1 : 0)}}",
+              "slug": "={{($json.title + '-' + $json.city).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}}",
+              "estado": "nuevo",
+              "apify_run_id": "={{$json.runId}}"
+            }
+          }
+        },
+        {
+          "nodo": "Activar generación de contenido",
+          "tipo": "n8n-nodes-base.executeWorkflow",
+          "config": {
+            "workflowId": "2_GENERAR_CONTENIDO"
+          }
+        }
+      ]
+    },
+
+    {
+      "nombre": "2_GENERAR_CONTENIDO_CON_CLAUDE",
+      "descripcion": "Para cada prospecto nuevo, llama a Claude para generar el contenido del sitio web",
+      "trigger": "Llamado desde flujo 1 o manualmente desde el dashboard",
+      "pasos": [
+        {
+          "nodo": "Obtener prospectos sin contenido",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "select",
+            "table": "prospectos",
+            "filters": {
+              "estado": "eq.nuevo",
+              "tiene_email": "eq.true",
+              "contenido_web": "is.null"
+            },
+            "limit": 50
+          }
+        },
+        {
+          "nodo": "Generar contenido con Claude",
+          "tipo": "n8n-nodes-base.httpRequest",
+          "iteracion": true,
+          "config": {
+            "url": "https://api.anthropic.com/v1/messages",
+            "method": "POST",
+            "headers": {
+              "x-api-key": "{{$env.CLAUDE_API_KEY}}",
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json"
+            },
+            "body": {
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 2000,
+              "messages": [{
+                "role": "user",
+                "content": "Eres un experto en marketing digital. Genera el contenido para el sitio web de este negocio en formato JSON.\n\nNegocio: {{$json.nombre}}\nSector: {{$json.sector}}\nCiudad: {{$json.ciudad}}\nDescripción: {{$json.descripcion || 'Negocio local en ' + $json.ciudad}}\nReseñas: {{$json.num_reseñas || 0}} en Google\n\nResponde SOLO con JSON válido sin texto adicional:\n{\n  \"hero_titulo\": \"(frase poderosa de 6-10 palabras)\",\n  \"hero_subtitulo\": \"(propuesta de valor, 1-2 oraciones)\",\n  \"cta_principal\": \"(texto del botón principal)\",\n  \"sobre_nosotros\": \"(2-3 oraciones sobre el negocio)\",\n  \"servicios\": [\n    {\"nombre\": \"...\", \"descripcion\": \"...\"},\n    {\"nombre\": \"...\", \"descripcion\": \"...\"},\n    {\"nombre\": \"...\", \"descripcion\": \"...\"}\n  ],\n  \"meta_titulo\": \"(SEO title tag)\",\n  \"meta_descripcion\": \"(SEO meta description 150 chars)\",\n  \"colores\": {\"primario\": \"#hexcolor\", \"acento\": \"#hexcolor\"}\n}"
+              }]
+            }
+          }
+        },
+        {
+          "nodo": "Parsear respuesta de Claude",
+          "tipo": "n8n-nodes-base.code",
+          "config": {
+            "jsCode": "const resp = $input.first().json.content[0].text; const contenido = JSON.parse(resp); return [{ json: { ...contenido, prospecto_id: $('Obtener prospectos sin contenido').item.json.id } }];"
+          }
+        },
+        {
+          "nodo": "Guardar contenido en Supabase",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "update",
+            "table": "prospectos",
+            "id": "={{$json.prospecto_id}}",
+            "data": {
+              "contenido_web": "={{$json}}",
+              "colores": "={{JSON.stringify({primario: $json.colores?.primario || '#0f172a', acento: $json.colores?.acento || '#f0c060'})}}",
+              "estado": "contenido_listo"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "nombre": "3_ENVIAR_EMAIL_CON_RESEND",
+      "descripcion": "Envía el email de propuesta con el link único a cada prospecto",
+      "trigger": "Manual desde dashboard o automático al completar flujo 2",
+      "pasos": [
+        {
+          "nodo": "Obtener prospectos listos",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "select",
+            "table": "prospectos",
+            "filters": {
+              "estado": "eq.contenido_listo",
+              "tiene_email": "eq.true"
+            },
+            "limit": 100
+          }
+        },
+        {
+          "nodo": "Enviar email con Resend",
+          "tipo": "n8n-nodes-base.httpRequest",
+          "iteracion": true,
+          "config": {
+            "url": "https://api.resend.com/emails",
+            "method": "POST",
+            "headers": {
+              "Authorization": "Bearer {{$env.RESEND_API_KEY}}",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "from": "Apex Digital Growth <hola@apexdigitalgrowth.com>",
+              "to": ["{{$json.email}}"],
+              "subject": "{{$json.nombre}} — Su sitio web está listo para ver",
+              "html": "<div style='font-family:Arial;max-width:600px;margin:0 auto'><h2>Hola,</h2><p>Creamos un sitio web profesional para <strong>{{$json.nombre}}</strong>.</p><p>Ábralo aquí:<br><a href='https://apexdigitalgrowth.com/propuesta/{{$json.slug}}' style='display:inline-block;margin:1rem 0;padding:0.75rem 2rem;background:#f0c060;color:#111;font-weight:bold;text-decoration:none;border-radius:6px'>Ver mi sitio web →</a></p><p>Si le gusta, puede comprarlo directamente con tarjeta. Si tiene preguntas, responda este correo.</p><hr><p style='font-size:11px;color:#999'>Apex Digital Growth · Si no desea recibir más correos, responda NO GRACIAS. Ley 1581/2012.</p></div>"
+            }
+          }
+        },
+        {
+          "nodo": "Marcar como enviado en Supabase",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "update",
+            "table": "prospectos",
+            "id": "={{$('Obtener prospectos listos').item.json.id}}",
+            "data": {
+              "estado": "email_enviado",
+              "email_enviado_at": "={{new Date().toISOString()}}"
+            }
+          }
+        },
+        {
+          "nodo": "Registrar en tabla emails",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "insert",
+            "table": "emails",
+            "data": {
+              "prospecto_id": "={{$('Obtener prospectos listos').item.json.id}}",
+              "resend_id": "={{$json.id}}",
+              "asunto": "Su sitio web está listo",
+              "plantilla": "nuevo_sitio"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "nombre": "4_PAGO_CONFIRMADO_DEPLOY",
+      "descripcion": "Cuando Stripe confirma el pago, activa el deploy y notifica por Telegram",
+      "trigger": "Webhook desde Next.js (Stripe → /api/webhook-stripe → N8N)",
+      "pasos": [
+        {
+          "nodo": "Webhook recibir pago",
+          "tipo": "n8n-nodes-base.webhook",
+          "config": {
+            "path": "pago-confirmado",
+            "method": "POST"
+          }
+        },
+        {
+          "nodo": "Obtener datos del prospecto",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "select",
+            "table": "prospectos",
+            "filters": { "id": "eq.{{$json.prospecto_id}}" },
+            "limit": 1
+          }
+        },
+        {
+          "nodo": "Notificar por Telegram (Apex interno)",
+          "tipo": "n8n-nodes-base.telegram",
+          "config": {
+            "chatId": "{{$env.TELEGRAM_APEX_CHAT_ID}}",
+            "message": "💰 *PAGO RECIBIDO*\n\nCliente: {{$json.nombre}}\nPlan: {{$json.plan_comprado}}\nMonto: ${{$json.monto}} USD\nEmail: {{$json.email}}\n\nSlug: {{$json.slug}}\n\n✅ Deploy iniciado automáticamente"
+          }
+        },
+        {
+          "nodo": "Crear cliente en tabla clientes",
+          "tipo": "n8n-nodes-base.supabase",
+          "config": {
+            "operation": "insert",
+            "table": "clientes",
+            "data": {
+              "prospecto_id": "={{$('Obtener datos del prospecto').item.json.id}}",
+              "codigo_activacion": "=APEX-{{Math.random().toString(36).substr(2,4).toUpperCase()}}",
+              "plan": "={{$('Obtener datos del prospecto').item.json.plan_comprado}}",
+              "url_sitio": "=https://{{$('Obtener datos del prospecto').item.json.slug}}.apexdigitalgrowth.com",
+              "fecha_renovacion": "={{new Date(Date.now() + 365*24*60*60*1000).toISOString()}}"
+            }
+          }
+        },
+        {
+          "nodo": "Email de bienvenida al cliente",
+          "tipo": "n8n-nodes-base.httpRequest",
+          "config": {
+            "url": "https://api.resend.com/emails",
+            "method": "POST",
+            "headers": { "Authorization": "Bearer {{$env.RESEND_API_KEY}}" },
+            "body": {
+              "from": "Apex Digital Growth <hola@apexdigitalgrowth.com>",
+              "to": ["{{$('Obtener datos del prospecto').item.json.email}}"],
+              "subject": "¡Bienvenido! Tu sitio web está activo",
+              "html": "<h2>¡Felicitaciones!</h2><p>Tu sitio web está activo en:<br><a href='https://{{$json.slug}}.apexdigitalgrowth.com'>{{$json.slug}}.apexdigitalgrowth.com</a></p><p>Tu código de activación para el bot de Telegram: <strong>APEX-XXXX</strong></p>"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
